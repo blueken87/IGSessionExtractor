@@ -450,6 +450,8 @@ static NSString *IGSEDocumentsDirectory(void) {
 static NSString *IGSEWriteData(NSData *data, NSString *filename) {
     NSFileManager *manager = [NSFileManager defaultManager];
     NSArray *directories = @[
+        [@"/var/jb/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName],
+        [@"/var/jb/var/mobile/Library/Preferences" stringByAppendingPathComponent:kIGSEDirName],
         [@"/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName],
         [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kIGSEDirName],
         IGSEDocumentsDirectory()
@@ -475,6 +477,7 @@ static void IGSELog(NSString *message) {
     NSFileManager *manager = [NSFileManager defaultManager];
     NSArray *directories = @[
         IGSEDocumentsDirectory(),
+        [@"/var/jb/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName],
         [@"/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName]
     ];
     for (NSString *directory in directories) {

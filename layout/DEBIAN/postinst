@@ -1,6 +1,10 @@
 #!/bin/sh
 
-for dir in /var/mobile/Documents/IGSession /var/mobile/Library/Preferences/IGSession; do
+for dir in \
+    /var/jb/var/mobile/Documents/IGSession \
+    /var/jb/var/mobile/Library/Preferences/IGSession \
+    /var/mobile/Documents/IGSession \
+    /var/mobile/Library/Preferences/IGSession; do
     mkdir -p "$dir"
     chown mobile:mobile "$dir" 2>/dev/null
     chmod 777 "$dir" 2>/dev/null
