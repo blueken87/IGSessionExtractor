@@ -1,0 +1,9 @@
+Package: com.bluek.igsessionextractor
+Name: IGSessionExtractor
+Version: 1.0.0
+Description: Export Instagram session cookies in instagrapi settings format. Shake the app or send it to background to export.
+Author: bluek
+Maintainer: bluek
+Section: Tweaks
+Architecture: iphoneos-arm64
+Depends: mobilesubstrate, firmware (>= 15.0)

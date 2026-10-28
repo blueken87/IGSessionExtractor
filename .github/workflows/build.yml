@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: /Users/runner/theos
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ldid xz
+
+      - name: Install Theos
+        run: git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Install iOS SDK
+        run: $THEOS/bin/install-sdk latest
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: Verify package
+        run: python3 tests/verify_build.py
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: IGSessionExtractor.deb
+          path: packages/*.deb
+          if-no-files-found: error
