@@ -10,6 +10,11 @@ static NSString *const kIGSEGenerator = @"IGSessionExtractor";
 static NSMutableDictionary<NSString *, NSString *> *s_headers;
 static NSMutableDictionary<NSString *, NSString *> *s_extraCookies;
 static NSDictionary *s_authorizationData;
+static NSString *s_activeUserID;
+static NSString *s_mid;
+static NSString *s_deviceID;
+static NSString *s_clientSessionID;
+static NSString *s_wwwClaim;
 static NSObject *s_lock;
 static BOOL s_dumping;
 static NSTimeInterval s_lastDump;
@@ -35,7 +40,16 @@ static BOOL IGSEWantedHeader(NSString *key) {
 
 static NSDictionary *IGSEParseAuthorization(NSString *value) {
     if (![value hasPrefix:@"Bearer IGT:2:"]) return nil;
-    NSString *base64 = [value substringFromIndex:13];
+    NSString *raw = [value substringFromIndex:13];
+    NSMutableString *base64 = [NSMutableString string];
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        BOOL ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' ||
+                  c == '-' || c == '_';
+        if (!ok) break;
+        [base64 appendFormat:@"%C", (unichar)(c == '-' ? '+' : (c == '_' ? '/' : c))];
+    }
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
     if (data.length == 0) return nil;
     id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -236,6 +250,26 @@ static void IGSEParseSessionFromText(NSString *text) {
     }
 }
 
+static void IGSEParseAuthText(NSString *text, NSMutableDictionary *authByUser) {
+    if (text.length == 0) return;
+    NSRange bearer = [text rangeOfString:@"Bearer IGT:2:"];
+    if (bearer.location != NSNotFound) {
+        NSString *value = [text substringFromIndex:bearer.location];
+        NSDictionary *auth = IGSEParseAuthorization(value);
+        NSString *userID = auth[@"ds_user_id"];
+        if (userID.length) authByUser[userID] = auth;
+    }
+    if ([text hasPrefix:@"{"]) {
+        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+        id object = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([object isKindOfClass:NSDictionary.class]) {
+            for (id value in [object allValues]) {
+                if ([value isKindOfClass:NSString.class]) IGSEParseAuthText(value, authByUser);
+            }
+        }
+    }
+}
+
 static void IGSEScanKeychain(void) {
     NSDictionary *query = @{
         (__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
@@ -251,6 +285,8 @@ static void IGSEScanKeychain(void) {
     }
     NSArray *items = CFBridgingRelease(result);
     IGSELog([NSString stringWithFormat:@"keychain items=%lu", (unsigned long)items.count]);
+    NSMutableDictionary *authByUser = [NSMutableDictionary dictionary];
+    NSMutableDictionary *claimsByUser = [NSMutableDictionary dictionary];
     for (NSDictionary *item in items) {
         NSString *service = item[(__bridge NSString *)kSecAttrService];
         NSString *account = item[(__bridge NSString *)kSecAttrAccount];
@@ -264,7 +300,41 @@ static void IGSEScanKeychain(void) {
         IGSELog([NSString stringWithFormat:@"keychain service=%@ account=%@ len=%lu text=%@",
                  service ?: @"", account ?: @"", (unsigned long)data.length,
                  text.length > 300 ? [text substringToIndex:300] : (text ?: @"")]);
+
+        if ([lower containsString:@"last_logged_in_user_pk"] && text.length) {
+            @synchronized(s_lock) { s_activeUserID = text; }
+        }
+        if ([lower containsString:@"activeaccount"] && account.length) {
+            @synchronized(s_lock) { s_activeUserID = account; }
+        }
+        if ([lower containsString:@"mid"] && text.length) {
+            @synchronized(s_lock) { s_mid = text; }
+        }
+        if (([lower containsString:@"deviceid"] || [lower containsString:@"unique_id"]) && text.length) {
+            @synchronized(s_lock) { s_deviceID = text; }
+        }
+        if ([lower containsString:@"loggingclaims"] && text.length) {
+            NSData *jsonData = [text dataUsingEncoding:NSUTF8StringEncoding];
+            id object = jsonData ? [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil] : nil;
+            if ([object isKindOfClass:NSDictionary.class]) {
+                [claimsByUser addEntriesFromDictionary:object];
+            }
+        }
+        IGSEParseAuthText(text, authByUser);
         IGSEParseSessionFromText(text);
+    }
+
+    NSString *active = nil;
+    @synchronized(s_lock) { active = s_activeUserID; }
+    NSDictionary *chosenAuth = active ? authByUser[active] : authByUser.allValues.firstObject;
+    if (chosenAuth) {
+        @synchronized(s_lock) { s_authorizationData = chosenAuth; }
+        IGSELog([NSString stringWithFormat:@"authorization from keychain user=%@", chosenAuth[@"ds_user_id"]]);
+    }
+    id claimValue = active ? claimsByUser[active] : claimsByUser.allValues.firstObject;
+    NSString *claim = [claimValue isKindOfClass:NSString.class] ? claimValue : nil;
+    if (claim.length) {
+        @synchronized(s_lock) { s_wwwClaim = claim; }
     }
 }
 
@@ -277,14 +347,25 @@ static void IGSEScanDefaults(void) {
         NSString *text = [value isKindOfClass:NSString.class] ? value : [value description];
         IGSELog([NSString stringWithFormat:@"defaults %@=%@", key,
                  text.length > 300 ? [text substringToIndex:300] : text]);
+        if ([key isEqualToString:@"kFBPreviousAppSessionID"] || [key isEqualToString:@"session_id"]) {
+            @synchronized(s_lock) { s_clientSessionID = text; }
+        }
         IGSEParseSessionFromText(text);
     }
 }
 
 static NSDictionary *IGSEBuildSettings(void) {
     NSDictionary *authorization = nil;
+    NSString *storedMid = nil;
+    NSString *storedDeviceID = nil;
+    NSString *storedClientSessionID = nil;
+    NSString *storedClaim = nil;
     @synchronized(s_lock) {
         authorization = s_authorizationData;
+        storedMid = s_mid;
+        storedDeviceID = s_deviceID;
+        storedClientSessionID = s_clientSessionID;
+        storedClaim = s_wwwClaim;
     }
 
     IGSEScanKeychain();
@@ -322,9 +403,9 @@ static NSDictionary *IGSEBuildSettings(void) {
     if (timezoneOffset == 0) timezoneOffset = NSTimeZone.localTimeZone.secondsFromGMT;
 
     NSMutableDictionary *uuids = [NSMutableDictionary dictionary];
-    uuids[@"uuid"] = IGSEHeader(@"x-ig-device-id") ?: IGSEUUID();
+    uuids[@"uuid"] = IGSEHeader(@"x-ig-device-id") ?: storedDeviceID ?: IGSEUUID();
     uuids[@"phone_id"] = IGSEHeader(@"x-ig-family-device-id") ?: IGSEUUID();
-    uuids[@"client_session_id"] = IGSEHeader(@"x-pigeon-session-id") ?: IGSEUUID();
+    uuids[@"client_session_id"] = IGSEHeader(@"x-pigeon-session-id") ?: storedClientSessionID ?: IGSEUUID();
     uuids[@"android_device_id"] = IGSEHeader(@"x-ig-android-id") ?: IGSEAndroidID();
     uuids[@"advertising_id"] = IGSEUUID();
     uuids[@"request_id"] = IGSEUUID();
@@ -337,9 +418,9 @@ static NSDictionary *IGSEBuildSettings(void) {
     settings[@"cookies"] = cookies;
     settings[@"authorization_data"] = auth;
     settings[@"uuids"] = uuids;
-    settings[@"mid"] = cookies[@"mid"] ?: IGSEHeader(@"x-mid") ?: @"";
+    settings[@"mid"] = cookies[@"mid"] ?: IGSEHeader(@"x-mid") ?: storedMid ?: @"";
     settings[@"ig_u_rur"] = IGSEHeader(@"ig-u-rur") ?: cookies[@"rur"] ?: @"";
-    settings[@"ig_www_claim"] = IGSEHeader(@"x-ig-www-claim") ?: @"";
+    settings[@"ig_www_claim"] = IGSEHeader(@"x-ig-www-claim") ?: storedClaim ?: @"";
     settings[@"locale"] = locale;
     settings[@"country"] = country.uppercaseString;
     settings[@"country_code"] = @1;
