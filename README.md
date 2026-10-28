@@ -19,6 +19,8 @@ python tools/import_session.py ig_xxx_1234567890.json
 
 Script sẽ `set_settings`, kiểm tra bằng `account_info()`, rồi lưu lại session đã chuẩn hoá.
 
+Nếu không thấy file, mở Filza vào `Documents/IGSession/` của container Instagram và gửi log `IGSessionExtractor.log`.
+
 Nếu `set_settings` lỗi, dùng sessionid:
 
 ```python

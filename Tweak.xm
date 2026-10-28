@@ -272,6 +272,8 @@ static NSString *IGSEDocumentsDirectory(void) {
     return [documents stringByAppendingPathComponent:kIGSEDirName];
 }
 
+static void IGSELog(NSString *message);
+
 static NSString *IGSEWriteData(NSData *data, NSString *filename) {
     NSFileManager *manager = [NSFileManager defaultManager];
     NSArray *directories = @[
@@ -287,9 +289,33 @@ static NSString *IGSEWriteData(NSData *data, NSString *filename) {
         if ([data writeToFile:path options:NSDataWritingAtomic error:&error]) {
             [manager setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:path error:nil];
             if (!firstPath) firstPath = path;
+        } else {
+            IGSELog([NSString stringWithFormat:@"write fail %@: %@", path, error.localizedDescription ?: @"?"]);
         }
     }
     return firstPath;
+}
+
+static void IGSELog(NSString *message) {
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *manager = [NSFileManager defaultManager];
+    NSArray *directories = @[
+        IGSEDocumentsDirectory(),
+        [@"/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName]
+    ];
+    for (NSString *directory in directories) {
+        [manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *path = [directory stringByAppendingPathComponent:@"IGSessionExtractor.log"];
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (handle) {
+            [handle seekToEndOfFile];
+            [handle writeData:data];
+            [handle closeFile];
+        } else {
+            [data writeToFile:path atomically:NO];
+        }
+    }
 }
 
 static void IGSEAlert(NSString *title, NSString *message) {
@@ -311,6 +337,31 @@ static void IGSEAlert(NSString *title, NSString *message) {
     });
 }
 
+static void IGSEShareFile(NSString *path) {
+    if (path.length == 0) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = UIApplication.sharedApplication.keyWindow;
+        if (!window) {
+            for (UIWindow *candidate in UIApplication.sharedApplication.windows) {
+                if (candidate.isKeyWindow) { window = candidate; break; }
+            }
+        }
+        UIViewController *controller = window.rootViewController;
+        while (controller.presentedViewController) controller = controller.presentedViewController;
+        if (!controller) return;
+        UIActivityViewController *share = [[UIActivityViewController alloc]
+            initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+            applicationActivities:nil];
+        if (share.popoverPresentationController) {
+            share.popoverPresentationController.sourceView = controller.view;
+            share.popoverPresentationController.sourceRect = CGRectMake(
+                CGRectGetMidX(controller.view.bounds),
+                CGRectGetMidY(controller.view.bounds), 1, 1);
+        }
+        [controller presentViewController:share animated:YES completion:nil];
+    });
+}
+
 static void IGSEDump(BOOL showAlert) {
     @synchronized(s_lock) {
         if (s_dumping) return;
@@ -328,9 +379,12 @@ static void IGSEDump(BOOL showAlert) {
     }];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        IGSELog(@"dump start");
         NSDictionary *settings = IGSEBuildSettings();
         NSString *message = nil;
+        NSString *jsonPath = nil;
         if (!settings) {
+            IGSELog(@"no sessionid");
             message = @"Chưa có sessionid. Hãy đăng nhập Instagram trước.";
         } else {
             NSError *error = nil;
@@ -344,8 +398,10 @@ static void IGSEDump(BOOL showAlert) {
                               IGSESafeName(username), IGSESafeName(userID)];
             NSDictionary *cookies = settings[@"cookies"];
             NSData *sessionData = [cookies[@"sessionid"] dataUsingEncoding:NSUTF8StringEncoding];
-            NSString *jsonPath = json ? IGSEWriteData(json, [base stringByAppendingString:@".json"]) : nil;
+            jsonPath = json ? IGSEWriteData(json, [base stringByAppendingString:@".json"]) : nil;
             NSString *sessionPath = IGSEWriteData(sessionData, [base stringByAppendingString:@".sessionid.txt"]);
+            IGSELog([NSString stringWithFormat:@"cookies=%lu user=%@ id=%@ json=%@ session=%@",
+                     (unsigned long)cookies.count, username, userID, jsonPath ?: @"(nil)", sessionPath ?: @"(nil)"]);
             if (jsonPath) {
                 IGSEWriteData(json, @"latest.json");
                 if (sessionPath) {
@@ -365,7 +421,13 @@ static void IGSEDump(BOOL showAlert) {
             [UIApplication.sharedApplication endBackgroundTask:task];
             task = UIBackgroundTaskInvalid;
         }
-        if (showAlert) IGSEAlert(@"IGSessionExtractor", message);
+        if (showAlert) {
+            if (jsonPath) {
+                IGSEShareFile(jsonPath);
+            } else {
+                IGSEAlert(@"IGSessionExtractor", message);
+            }
+        }
     });
 }
 
@@ -459,6 +521,18 @@ static void IGSEDump(BOOL showAlert) {
                     usingBlock:^(NSNotification *note) {
         IGSEDump(NO);
     }];
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *note) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            IGSEDump(NO);
+        });
+    }];
 
+    IGSELog([NSString stringWithFormat:@"loaded bundle=%@ process=%@",
+             NSBundle.mainBundle.bundleIdentifier ?: @"(nil)",
+             NSProcessInfo.processInfo.processName ?: @"(nil)"]);
     NSLog(@"[IGSessionExtractor] loaded");
 }
