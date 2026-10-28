@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <objc/runtime.h>
+#import <Security/Security.h>
 
 static NSString *const kIGSEDirName = @"IGSession";
 static NSString *const kIGSEGenerator = @"IGSessionExtractor";
@@ -12,6 +13,8 @@ static NSDictionary *s_authorizationData;
 static NSObject *s_lock;
 static BOOL s_dumping;
 static NSTimeInterval s_lastDump;
+
+static void IGSELog(NSString *message);
 
 static BOOL IGSEIsInstagramURL(NSURL *url) {
     NSString *host = url.host.lowercaseString;
@@ -51,6 +54,18 @@ static void IGSEMergeCookieHeader(NSString *value) {
     }
 }
 
+static void IGSECaptureCookie(NSHTTPCookie *cookie) {
+    if (![cookie.domain.lowercaseString containsString:@"instagram.com"]) return;
+    if (cookie.name.length == 0 || cookie.value.length == 0) return;
+    @synchronized(s_lock) {
+        s_extraCookies[cookie.name] = cookie.value;
+    }
+}
+
+static void IGSECaptureCookieArray(NSArray<NSHTTPCookie *> *cookies) {
+    for (NSHTTPCookie *cookie in cookies) IGSECaptureCookie(cookie);
+}
+
 static void IGSECaptureHeader(NSString *field, NSString *value, NSURL *url) {
     if (field.length == 0 || value.length == 0 || !IGSEIsInstagramURL(url)) return;
     NSString *key = field.lowercaseString;
@@ -58,7 +73,10 @@ static void IGSECaptureHeader(NSString *field, NSString *value, NSURL *url) {
     @synchronized(s_lock) {
         if ([key isEqualToString:@"authorization"]) {
             NSDictionary *parsed = IGSEParseAuthorization(value);
-            if (parsed) s_authorizationData = parsed;
+            if (parsed) {
+                s_authorizationData = parsed;
+                IGSELog(@"authorization captured");
+            }
         } else if ([key isEqualToString:@"cookie"]) {
             IGSEMergeCookieHeader(value);
         } else {
@@ -158,12 +176,17 @@ static NSDictionary *IGSECollectCookies(void) {
             if (cookie.name.length && cookie.value.length) cookies[cookie.name] = cookie.value;
         }
     }
-    for (NSHTTPCookie *cookie in storage.cookies) {
+    NSArray *allCookies = storage.cookies;
+    IGSELog([NSString stringWithFormat:@"storage cookies=%lu", (unsigned long)allCookies.count]);
+    for (NSHTTPCookie *cookie in allCookies) {
         if (![cookie.domain.lowercaseString containsString:@"instagram.com"]) continue;
+        IGSELog([NSString stringWithFormat:@"cookie %@ domain=%@ len=%lu",
+                 cookie.name, cookie.domain, (unsigned long)cookie.value.length]);
         if (cookie.name.length && cookie.value.length) cookies[cookie.name] = cookie.value;
     }
     @synchronized(s_lock) {
         [cookies addEntriesFromDictionary:s_extraCookies];
+        IGSELog([NSString stringWithFormat:@"captured cookies=%lu", (unsigned long)s_extraCookies.count]);
     }
     return cookies;
 }
@@ -189,12 +212,83 @@ static NSString *IGSESafeName(NSString *name) {
     return out.length ? out : @"unknown";
 }
 
+static void IGSEParseSessionFromText(NSString *text) {
+    if (text.length == 0) return;
+    NSRange marker = [text rangeOfString:@"sessionid"];
+    if (marker.location == NSNotFound) return;
+    NSUInteger index = NSMaxRange(marker);
+    NSCharacterSet *skip = [NSCharacterSet characterSetWithCharactersInString:@"\"':= \\"];
+    while (index < text.length && [skip characterIsMember:[text characterAtIndex:index]]) index++;
+    NSMutableString *value = [NSMutableString string];
+    while (index < text.length) {
+        unichar c = [text characterAtIndex:index];
+        BOOL ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '%' || c == ':' || c == '-' || c == '_';
+        if (!ok) break;
+        [value appendFormat:@"%C", c];
+        index++;
+    }
+    if (value.length > 30) {
+        @synchronized(s_lock) {
+            s_extraCookies[@"sessionid"] = value;
+        }
+        IGSELog([NSString stringWithFormat:@"sessionid from keychain len=%lu", (unsigned long)value.length]);
+    }
+}
+
+static void IGSEScanKeychain(void) {
+    NSDictionary *query = @{
+        (__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
+        (__bridge NSString *)kSecReturnAttributes: @YES,
+        (__bridge NSString *)kSecReturnData: @YES,
+        (__bridge NSString *)kSecMatchLimit: (__bridge NSString *)kSecMatchLimitAll
+    };
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status != errSecSuccess || result == NULL) {
+        IGSELog([NSString stringWithFormat:@"keychain scan status=%d", (int)status]);
+        return;
+    }
+    NSArray *items = CFBridgingRelease(result);
+    IGSELog([NSString stringWithFormat:@"keychain items=%lu", (unsigned long)items.count]);
+    for (NSDictionary *item in items) {
+        NSString *service = item[(__bridge NSString *)kSecAttrService];
+        NSString *account = item[(__bridge NSString *)kSecAttrAccount];
+        NSData *data = item[(__bridge NSString *)kSecValueData];
+        NSString *lower = [NSString stringWithFormat:@"%@ %@", service ?: @"", account ?: @""].lowercaseString;
+        if (![lower containsString:@"instagram"] && ![lower containsString:@"session"] &&
+            ![lower containsString:@"burbn"]) {
+            continue;
+        }
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        IGSELog([NSString stringWithFormat:@"keychain service=%@ account=%@ len=%lu text=%@",
+                 service ?: @"", account ?: @"", (unsigned long)data.length,
+                 text.length > 300 ? [text substringToIndex:300] : (text ?: @"")]);
+        IGSEParseSessionFromText(text);
+    }
+}
+
+static void IGSEScanDefaults(void) {
+    NSDictionary *all = [NSUserDefaults standardUserDefaults].dictionaryRepresentation;
+    for (NSString *key in all) {
+        NSString *lower = key.lowercaseString;
+        if (![lower containsString:@"session"] && ![lower containsString:@"cookie"]) continue;
+        id value = all[key];
+        NSString *text = [value isKindOfClass:NSString.class] ? value : [value description];
+        IGSELog([NSString stringWithFormat:@"defaults %@=%@", key,
+                 text.length > 300 ? [text substringToIndex:300] : text]);
+        IGSEParseSessionFromText(text);
+    }
+}
+
 static NSDictionary *IGSEBuildSettings(void) {
     NSDictionary *authorization = nil;
     @synchronized(s_lock) {
         authorization = s_authorizationData;
     }
 
+    IGSEScanKeychain();
+    IGSEScanDefaults();
     NSMutableDictionary *cookies = [IGSECollectCookies() mutableCopy];
     NSString *sessionID = cookies[@"sessionid"];
     if (sessionID.length == 0) sessionID = authorization[@"sessionid"];
@@ -271,8 +365,6 @@ static NSString *IGSEDocumentsDirectory(void) {
     if (documents.length == 0) documents = NSTemporaryDirectory();
     return [documents stringByAppendingPathComponent:kIGSEDirName];
 }
-
-static void IGSELog(NSString *message);
 
 static NSString *IGSEWriteData(NSData *data, NSString *filename) {
     NSFileManager *manager = [NSFileManager defaultManager];
@@ -364,9 +456,15 @@ static void IGSEShareFile(NSString *path) {
 
 static void IGSEDump(BOOL showAlert) {
     @synchronized(s_lock) {
-        if (s_dumping) return;
+        if (s_dumping) {
+            IGSELog(@"dump skip busy");
+            return;
+        }
         NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        if (now - s_lastDump < 3.0) return;
+        if (now - s_lastDump < 3.0) {
+            IGSELog(@"dump skip debounce");
+            return;
+        }
         s_dumping = YES;
     }
 
@@ -471,8 +569,26 @@ static void IGSEDump(BOOL showAlert) {
 
 %hook NSHTTPCookieStorage
 
+- (NSArray<NSHTTPCookie *> *)cookies {
+    NSArray *cookies = %orig;
+    IGSECaptureCookieArray(cookies);
+    return cookies;
+}
+
+- (NSArray<NSHTTPCookie *> *)cookiesForURL:(NSURL *)URL {
+    NSArray *cookies = %orig;
+    IGSECaptureCookieArray(cookies);
+    return cookies;
+}
+
++ (NSHTTPCookieStorage *)sharedCookieStorageForGroupContainerIdentifier:(NSString *)identifier {
+    IGSELog([NSString stringWithFormat:@"cookie storage group=%@", identifier]);
+    return %orig;
+}
+
 - (void)setCookie:(NSHTTPCookie *)cookie {
     %orig;
+    IGSECaptureCookie(cookie);
     if ([cookie.domain.lowercaseString containsString:@"instagram.com"] &&
         [cookie.name isEqualToString:@"sessionid"]) {
         IGSEDump(NO);
@@ -483,6 +599,7 @@ static void IGSEDump(BOOL showAlert) {
             forURL:(NSURL *)URL
   mainDocumentURL:(NSURL *)mainDocumentURL {
     %orig;
+    IGSECaptureCookieArray(cookies);
     for (NSHTTPCookie *cookie in cookies) {
         if ([cookie.name isEqualToString:@"sessionid"] &&
             [cookie.domain.lowercaseString containsString:@"instagram.com"]) {
@@ -490,6 +607,16 @@ static void IGSEDump(BOOL showAlert) {
             break;
         }
     }
+}
+
+%end
+
+%hook NSHTTPCookie
+
++ (instancetype)cookieWithProperties:(NSDictionary<NSHTTPCookiePropertyKey, id> *)properties {
+    id cookie = %orig;
+    if ([cookie isKindOfClass:NSHTTPCookie.class]) IGSECaptureCookie(cookie);
+    return cookie;
 }
 
 %end

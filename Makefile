@@ -10,7 +10,7 @@ TWEAK_NAME = IGSessionExtractor
 
 IGSessionExtractor_FILES = Tweak.xm
 IGSessionExtractor_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-IGSessionExtractor_FRAMEWORKS = Foundation UIKit
+IGSessionExtractor_FRAMEWORKS = Foundation UIKit Security
 
 before-package::
 	chmod 0755 layout/DEBIAN/* 2>/dev/null || true

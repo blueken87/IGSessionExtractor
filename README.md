@@ -5,7 +5,7 @@ Tweak cho Instagram iOS: xuất cookie/session của tài khoản đang đăng n
 ## Cách dùng
 
 1. Cài tweak, mở Instagram và đăng nhập tài khoản cần lấy.
-2. **Lắc máy** để xuất ngay, hoặc đưa Instagram xuống background (tweak tự xuất).
+2. Tweak tự xuất sau ~3 giây khi mở app; hoặc **lắc máy** để xuất ngay và mở share sheet.
 3. File nằm trong thư mục `IGSession` của app (thường là `.../Documents/IGSession/`), gồm:
    - `ig_<username>_<user_id>.json` — settings để import.
    - `ig_<username>_<user_id>.sessionid.txt` — chỉ riêng sessionid.
