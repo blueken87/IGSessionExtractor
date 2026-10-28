@@ -184,7 +184,7 @@ static NSString *IGSESafeName(NSString *name) {
     NSMutableString *out = [NSMutableString string];
     for (NSUInteger i = 0; i < name.length; i++) {
         unichar c = [name characterAtIndex:i];
-        [out appendFormat:@"%C", [allowed characterIsMember:c] ? c : '_'];
+        [out appendFormat:@"%C", (unichar)([allowed characterIsMember:c] ? c : '_')];
     }
     return out.length ? out : @"unknown";
 }
