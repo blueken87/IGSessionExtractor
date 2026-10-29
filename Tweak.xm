@@ -16,10 +16,12 @@ static NSString *s_deviceID;
 static NSString *s_clientSessionID;
 static NSString *s_wwwClaim;
 static NSObject *s_lock;
+static NSMutableArray<NSString *> *s_logLines;
 static BOOL s_dumping;
 static NSTimeInterval s_lastDump;
 
 static void IGSELog(NSString *message);
+static void IGSEFlushLog(void);
 
 static BOOL IGSEIsInstagramURL(NSURL *url) {
     NSString *host = url.host.lowercaseString;
@@ -339,18 +341,16 @@ static void IGSEScanKeychain(void) {
 }
 
 static void IGSEScanDefaults(void) {
-    NSDictionary *all = [NSUserDefaults standardUserDefaults].dictionaryRepresentation;
-    for (NSString *key in all) {
-        NSString *lower = key.lowercaseString;
-        if (![lower containsString:@"session"] && ![lower containsString:@"cookie"]) continue;
-        id value = all[key];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    for (NSString *key in @[@"kFBPreviousAppSessionID", @"session_id"]) {
+        id value = [defaults objectForKey:key];
+        if (!value) continue;
         NSString *text = [value isKindOfClass:NSString.class] ? value : [value description];
         IGSELog([NSString stringWithFormat:@"defaults %@=%@", key,
                  text.length > 300 ? [text substringToIndex:300] : text]);
-        if ([key isEqualToString:@"kFBPreviousAppSessionID"] || [key isEqualToString:@"session_id"]) {
+        if ([key isEqualToString:@"kFBPreviousAppSessionID"]) {
             @synchronized(s_lock) { s_clientSessionID = text; }
         }
-        IGSEParseSessionFromText(text);
     }
 }
 
@@ -456,29 +456,39 @@ static NSString *IGSEWriteData(NSData *data, NSString *filename) {
         [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kIGSEDirName],
         IGSEDocumentsDirectory()
     ];
-    NSString *firstPath = nil;
     for (NSString *directory in directories) {
         [manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
         NSString *path = [directory stringByAppendingPathComponent:filename];
         NSError *error = nil;
         if ([data writeToFile:path options:NSDataWritingAtomic error:&error]) {
             [manager setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:path error:nil];
-            if (!firstPath) firstPath = path;
-        } else {
-            IGSELog([NSString stringWithFormat:@"write fail %@: %@", path, error.localizedDescription ?: @"?"]);
+            return path;
         }
+        IGSELog([NSString stringWithFormat:@"write fail %@: %@", path, error.localizedDescription ?: @"?"]);
     }
-    return firstPath;
+    return nil;
 }
 
 static void IGSELog(NSString *message) {
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *line = [NSString stringWithFormat:@"%@ %@", [NSDate date], message];
+    @synchronized(s_lock) {
+        if (!s_logLines) s_logLines = [NSMutableArray array];
+        [s_logLines addObject:line];
+    }
+}
+
+static void IGSEFlushLog(void) {
+    NSString *text = nil;
+    @synchronized(s_lock) {
+        if (s_logLines.count == 0) return;
+        text = [[s_logLines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+        [s_logLines removeAllObjects];
+    }
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     NSFileManager *manager = [NSFileManager defaultManager];
     NSArray *directories = @[
         IGSEDocumentsDirectory(),
-        [@"/var/jb/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName],
-        [@"/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName]
+        [@"/var/jb/var/mobile/Documents" stringByAppendingPathComponent:kIGSEDirName]
     ];
     for (NSString *directory in directories) {
         [manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
@@ -542,11 +552,13 @@ static void IGSEDump(BOOL showAlert) {
     @synchronized(s_lock) {
         if (s_dumping) {
             IGSELog(@"dump skip busy");
+            IGSEFlushLog();
             return;
         }
         NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        if (now - s_lastDump < 3.0) {
+        if (now - s_lastDump < 1.0) {
             IGSELog(@"dump skip debounce");
+            IGSEFlushLog();
             return;
         }
         s_dumping = YES;
@@ -599,6 +611,7 @@ static void IGSEDump(BOOL showAlert) {
             s_lastDump = [NSDate date].timeIntervalSince1970;
             s_dumping = NO;
         }
+        IGSEFlushLog();
         if (task != UIBackgroundTaskInvalid) {
             [UIApplication.sharedApplication endBackgroundTask:task];
             task = UIBackgroundTaskInvalid;
@@ -717,6 +730,7 @@ static void IGSEDump(BOOL showAlert) {
 %ctor {
     s_headers = [NSMutableDictionary dictionary];
     s_extraCookies = [NSMutableDictionary dictionary];
+    s_logLines = [NSMutableArray array];
     s_lock = [NSObject new];
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
@@ -736,7 +750,8 @@ static void IGSEDump(BOOL showAlert) {
                         object:nil
                          queue:NSOperationQueue.mainQueue
                     usingBlock:^(NSNotification *note) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+        IGSEDump(NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             IGSEDump(NO);
         });
@@ -745,5 +760,6 @@ static void IGSEDump(BOOL showAlert) {
     IGSELog([NSString stringWithFormat:@"loaded bundle=%@ process=%@",
              NSBundle.mainBundle.bundleIdentifier ?: @"(nil)",
              NSProcessInfo.processInfo.processName ?: @"(nil)"]);
+    IGSEFlushLog();
     NSLog(@"[IGSessionExtractor] loaded");
 }
